@@ -1,0 +1,499 @@
+(async () => {
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+    const SPEED = 10;
+
+    if (typeof window.DiscordNative === "undefined") {
+        const createSafeModule = (overrides = {}) => {
+            return new Proxy(overrides, {
+                get(target, prop) {
+                    if (prop in target) return target[prop];
+                    if (typeof prop === "symbol") return undefined;
+                    target[prop] = () => Promise.resolve(0);
+                    return target[prop];
+                }
+            });
+        };
+        const discordUtils = createSafeModule({
+            GetWindowFullscreenTypeByPid: (pid) => 0,
+            GetWindowFrameTitle: (pid) => ""
+        });
+        window.DiscordNative = createSafeModule({
+            nativeModules: createSafeModule({ discord_utils: discordUtils }),
+            app: createSafeModule({ getVersion: () => "1.0.9001" }),
+            ipc: createSafeModule({ send: () => {}, on: () => {}, invoke: () => Promise.resolve({}) })
+        });
+    }
+
+    if (!Array.isArray(webpackChunkdiscord_app)) {
+        console.log("%c[Quest] Refresh page first", "color:#ff4d4d;font-weight:bold");
+        return;
+    }
+
+    let wpRequire = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+    webpackChunkdiscord_app.pop();
+
+    let patchCount = 0;
+    const patchNativeFunctions = (obj, depth) => {
+        if (!obj || typeof obj !== "object" || depth > 3) return;
+        try {
+            for (const key of Object.keys(obj)) {
+                try {
+                    const val = obj[key];
+                    if (key === "GetWindowFullscreenTypeByPid" && typeof val === "function") {
+                        obj[key] = () => 0;
+                        patchCount++;
+                    }
+                    if (key === "getDiscordUtils" && typeof val === "function") {
+                        const safeUtils = new Proxy({}, {
+                            get: (t, p) => (p === "then" || typeof p === "symbol") ? undefined : () => 0
+                        });
+                        obj[key] = () => safeUtils;
+                        patchCount++;
+                    }
+                    if (key === "requireModule" && typeof val === "function") {
+                        const safeMod = new Proxy({}, {
+                            get: (t, p) => (p === "then" || typeof p === "symbol") ? undefined : () => 0
+                        });
+                        obj[key] = () => safeMod;
+                        patchCount++;
+                    }
+                    if (typeof val === "object" && val !== null && !Array.isArray(val)) {
+                        patchNativeFunctions(val, depth + 1);
+                    }
+                } catch (e) {}
+            }
+        } catch (e) {}
+    };
+
+    for (const [id, mod] of Object.entries(wpRequire.c)) {
+        if (!mod?.exports) continue;
+        patchNativeFunctions(mod.exports, 0);
+    }
+    console.log(`%c[PATCH] ${patchCount} native functions patched`, "color:#43b581");
+
+    let ApplicationStreamingStore = Object.values(wpRequire.c).find(x => x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata)?.exports?.A;
+    let RunningGameStore = Object.values(wpRequire.c).find(x => x?.exports?.Ay?.getRunningGames)?.exports?.Ay;
+    let QuestsStore = Object.values(wpRequire.c).find(x => x?.exports?.A?.__proto__?.getQuest)?.exports?.A;
+    let ChannelStore = Object.values(wpRequire.c).find(x => x?.exports?.A?.__proto__?.getAllThreadsForParent)?.exports?.A;
+    let GuildChannelStore = Object.values(wpRequire.c).find(x => x?.exports?.Ay?.getSFWDefaultChannel)?.exports?.Ay;
+    let FluxDispatcher = Object.values(wpRequire.c).find(x => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h;
+    let api = Object.values(wpRequire.c).find(x => x?.exports?.Bo?.get)?.exports?.Bo;
+
+    if (!QuestsStore || !api) {
+        console.log("%c[Quest] Critical stores missing", "color:#ff4d4d");
+        return;
+    }
+
+    const tasks = ["WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY"];
+
+    let quests = [...QuestsStore.quests.values()].filter(x =>
+        x.userStatus?.enrolledAt &&
+        !x.userStatus?.completedAt &&
+        new Date(x.config.expiresAt).getTime() > Date.now() &&
+        tasks.find(y => Object.keys((x.config.taskConfig ?? x.config.taskConfigV2).tasks).includes(y))
+    );
+
+    if (quests.length === 0) {
+        console.log("%c[Quest] No active quests", "color:#faa61a");
+        return;
+    }
+
+    console.log(`%c[Quest] ${quests.length} quest(s) | speed: ${SPEED}x`, "color:#00b0f4;font-weight:bold;font-size:14px");
+
+    const unhandledHandler = (e) => {
+        if (e.reason?.message?.includes("nativeModules") || e.reason?.message?.includes("native")) {
+            e.preventDefault();
+        }
+    };
+    window.addEventListener("unhandledrejection", unhandledHandler);
+
+    let activeGames = [];
+    let activeRealGRG = null;
+    let activeRealGGP = null;
+    let keepAliveTimer = null;
+
+    const installSpoof = (games) => {
+        activeGames = games;
+        if (RunningGameStore) {
+            if (!activeRealGRG) {
+                activeRealGRG = RunningGameStore.getRunningGames;
+                activeRealGGP = RunningGameStore.getGameForPID;
+            }
+            RunningGameStore.getRunningGames = () => activeGames;
+            RunningGameStore.getGameForPID = (p) => activeGames.find(g => g.pid === p) || null;
+        }
+        if (FluxDispatcher && games.length > 0) {
+            try {
+                FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: games, games });
+            } catch (e) {}
+        }
+    };
+
+    const removeSpoof = () => {
+        if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+        if (FluxDispatcher && activeGames.length > 0) {
+            try { FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: activeGames, added: [], games: [] }); } catch (e) {}
+        }
+        if (RunningGameStore && activeRealGRG) {
+            RunningGameStore.getRunningGames = activeRealGRG;
+            RunningGameStore.getGameForPID = activeRealGGP;
+            activeRealGRG = null;
+            activeRealGGP = null;
+        }
+        activeGames = [];
+    };
+
+    const startKeepAlive = () => {
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
+        keepAliveTimer = setInterval(() => {
+            if (FluxDispatcher && activeGames.length > 0) {
+                try {
+                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [], added: activeGames, games: activeGames });
+                } catch (e) {}
+            }
+        }, 60000);
+    };
+
+    const createFakeGame = (appData, applicationId, exeOverride) => {
+        const allExecutables = appData.executables ?? [];
+        const winExe = allExecutables.find(x => x.os === "win32" && !x.isLauncher) ??
+                       allExecutables.find(x => x.os === "win32") ??
+                       { name: appData.name };
+
+        const exeName = exeOverride ?? winExe.name?.replace(">", "") ?? appData.name.replace(/[\/\\:*?"<>|]/g, "");
+        const isLauncher = winExe.isLauncher ?? false;
+        const gameExe = allExecutables.find(x => x.os === "win32" && !x.isLauncher);
+        const actualExe = gameExe?.name?.replace(">", "") ?? exeName;
+
+        const pid = Math.floor(Math.random() * 30000) + 1000;
+        const gamePid = isLauncher ? pid + 1 : pid;
+
+        const primaryGame = {
+            cmdLine: isLauncher
+                ? `C:\\Users\\user\\AppData\\Local\\${appData.name}\\${actualExe}`
+                : `C:\\Program Files\\${appData.name}\\${exeName}`,
+            exeName: isLauncher ? actualExe : exeName,
+            exePath: isLauncher
+                ? `c:/users/user/appdata/local/${appData.name.toLowerCase()}/${actualExe}`
+                : `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+            hidden: false,
+            isLauncher: false,
+            id: applicationId,
+            name: appData.name,
+            pid: gamePid,
+            pidPath: isLauncher ? [pid, gamePid] : [pid],
+            processName: appData.name,
+            start: Date.now(),
+            launcherId: isLauncher ? applicationId : undefined
+        };
+
+        if (isLauncher) {
+            return [
+                {
+                    cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                    exeName: exeName,
+                    exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                    hidden: false,
+                    isLauncher: true,
+                    id: applicationId,
+                    name: `${appData.name} Launcher`,
+                    pid: pid,
+                    pidPath: [pid],
+                    processName: `${appData.name} Launcher`,
+                    start: Date.now() - 5000
+                },
+                primaryGame
+            ];
+        }
+
+        return [primaryGame];
+    };
+
+    const runVideoQuest = async (quest, taskName, secondsNeeded, secondsDone) => {
+        const questName = quest.config.messages.questName;
+        let finished = false;
+        let progress = secondsDone;
+        let attempts = 0;
+
+        while (!finished && attempts < 30) {
+            attempts++;
+            const chunk = Math.min(rand(SPEED - 2, SPEED + 2), secondsNeeded - progress);
+            if (chunk <= 0) break;
+            await sleep(rand(1000, 2000));
+            const jitter = (Math.random() - 0.5) * 1.5;
+            const reportTime = Math.min(secondsNeeded, Math.max(progress + chunk + jitter, progress + 0.5));
+            const res = await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: reportTime } });
+            if (res?.body?.completed_at != null) finished = true;
+            progress = Math.min(secondsNeeded, progress + chunk);
+            console.log(`  [video] ${questName}: ${Math.floor((progress / secondsNeeded) * 100)}%`);
+            if (progress >= secondsNeeded && !finished) {
+                await sleep(rand(500, 1500));
+                const fin = await api.post({ url: `/quests/${quest.id}/video-progress`, body: { timestamp: secondsNeeded } });
+                if (fin?.body?.completed_at != null) finished = true;
+            }
+        }
+        return finished;
+    };
+
+    const runActivityQuest = async (quest, secondsNeeded) => {
+        const questName = quest.config.messages.questName;
+        const channelId = ChannelStore?.getSortedPrivateChannels?.()[0]?.id ??
+            Object.values(GuildChannelStore?.getAllGuilds?.() ?? {})
+                .find(x => x != null && x.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id;
+        if (!channelId) return false;
+
+        const streamKey = `call:${channelId}:1`;
+        let attempts = 0;
+        let done = false;
+
+        while (!done && attempts < 90) {
+            attempts++;
+            try {
+                const res = await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: false } });
+                const progress = res?.body?.progress?.PLAY_ACTIVITY?.value ?? 0;
+                console.log(`  [activity] ${questName}: ${progress}/${secondsNeeded}`);
+                if (progress >= secondsNeeded) {
+                    await api.post({ url: `/quests/${quest.id}/heartbeat`, body: { stream_key: streamKey, terminal: true } });
+                    done = true;
+                } else {
+                    await sleep(rand(18000, 22000));
+                }
+            } catch (e) {
+                await sleep(rand(5000, 10000));
+            }
+        }
+        return done;
+    };
+
+    const runDesktopQuest = async (quest, taskName, secondsNeeded, secondsDone, fakeGames, solo = false) => {
+        const questName = quest.config.messages.questName;
+        let lastProgress = secondsDone;
+        let lastProgressTime = Date.now();
+        let gotHeartbeat = false;
+        let elapsed = 0;
+        const totalRemaining = secondsNeeded - secondsDone;
+        const maxWait = totalRemaining * 1000 + 300000;
+
+        return new Promise((resolve) => {
+            let resolved = false;
+
+            const check = setInterval(() => {
+                elapsed += 2000;
+                if (resolved) { clearInterval(check); return; }
+
+                if (gotHeartbeat && Date.now() - lastProgressTime > 300000) {
+                    resolved = true;
+                    clearInterval(check);
+                    resolve("stall");
+                }
+                if (!gotHeartbeat && elapsed > 180000) {
+                    resolved = true;
+                    clearInterval(check);
+                    resolve("no-heartbeat");
+                }
+                if (elapsed > maxWait) {
+                    resolved = true;
+                    clearInterval(check);
+                    resolve(false);
+                }
+
+                try {
+                    const fresh = QuestsStore.quests.get(quest.id);
+                    if (fresh?.userStatus?.completedAt && !resolved) {
+                        console.log(`  [desktop] ${questName}: COMPLETED ✓`);
+                        resolved = true;
+                        clearInterval(check);
+                        if (fn && FluxDispatcher) {
+                            try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn); } catch (e) {}
+                        }
+                        resolve(true);
+                    }
+                } catch (e) {}
+            }, 2000);
+
+            const fn = data => {
+                try {
+                    let progress = quest.config.configVersion === 1
+                        ? data?.userStatus?.streamProgressSeconds
+                        : Math.floor(data?.userStatus?.progress?.[taskName]?.value ?? 0);
+
+                    if (progress > 0 && progress !== lastProgress) {
+                        gotHeartbeat = true;
+                        lastProgress = progress;
+                        lastProgressTime = Date.now();
+                        const pct = Math.floor((progress / secondsNeeded) * 100);
+                        console.log(`  [desktop] ${questName}: ${progress}/${secondsNeeded} (${pct}%)`);
+                    }
+
+                    if (progress >= secondsNeeded && !resolved) {
+                        resolved = true;
+                        clearInterval(check);
+                        if (FluxDispatcher) {
+                            try { FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn); } catch (e) {}
+                        }
+                        resolve(true);
+                    }
+                } catch (e) {}
+            };
+
+            if (FluxDispatcher) {
+                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            }
+        });
+    };
+
+    let completed = 0;
+    let failed = 0;
+
+    const videoQuests = quests.filter(q => {
+        const tn = tasks.find(x => (q.config.taskConfig ?? q.config.taskConfigV2).tasks[x] != null);
+        return tn === "WATCH_VIDEO" || tn === "WATCH_VIDEO_ON_MOBILE";
+    });
+
+    const activityQuests = quests.filter(q => {
+        const tn = tasks.find(x => (q.config.taskConfig ?? q.config.taskConfigV2).tasks[x] != null);
+        return tn === "PLAY_ACTIVITY";
+    });
+
+    const desktopQuests = quests.filter(q => {
+        const tn = tasks.find(x => (q.config.taskConfig ?? q.config.taskConfigV2).tasks[x] != null);
+        return tn === "PLAY_ON_DESKTOP" || tn === "STREAM_ON_DESKTOP";
+    });
+
+    console.log(`  ${videoQuests.length} video | ${desktopQuests.length} desktop | ${activityQuests.length} activity`);
+
+    const videoPromises = videoQuests.map(async (quest) => {
+        const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+        const taskName = tasks.find(x => taskConfig.tasks[x] != null);
+        const taskData = taskConfig.tasks[taskName];
+        const secondsNeeded = taskData.target;
+        const secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+        if (secondsDone >= secondsNeeded) { completed++; return; }
+        const success = await runVideoQuest(quest, taskName, secondsNeeded, secondsDone);
+        if (success) { console.log(`%c[✓] ${quest.config.messages.questName}`, "color:#43b581;font-weight:bold"); completed++; }
+        else { console.log(`%c[✗] ${quest.config.messages.questName}`, "color:#ff4d4d"); failed++; }
+    });
+
+    const activityPromises = activityQuests.map(async (quest) => {
+        const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+        const taskName = tasks.find(x => taskConfig.tasks[x] != null);
+        const taskData = taskConfig.tasks[taskName];
+        const secondsNeeded = taskData.target;
+        const secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+        if (secondsDone >= secondsNeeded) { completed++; return; }
+        const success = await runActivityQuest(quest, secondsNeeded);
+        if (success) { console.log(`%c[✓] ${quest.config.messages.questName}`, "color:#43b581;font-weight:bold"); completed++; }
+        else { console.log(`%c[✗] ${quest.config.messages.questName}`, "color:#ff4d4d"); failed++; }
+    });
+
+    console.log(`%c[Phase 1] Video + Activity quests running in parallel`, "color:#faa61a;font-weight:bold");
+
+    let desktopPromises = [];
+
+    if (desktopQuests.length > 0) {
+        console.log(`%c[Phase 2] Desktop quests — checking game types...`, "color:#faa61a;font-weight:bold");
+
+        const parallelGames = [];
+        const launcherQuests = [];
+        const allFakeGames = [];
+
+        for (const quest of desktopQuests) {
+            const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+            const taskName = tasks.find(x => taskConfig.tasks[x] != null);
+            const taskData = taskConfig.tasks[taskName];
+            const applicationId = quest.config.application?.id ?? taskData.applications?.[0]?.id;
+            const secondsNeeded = taskData.target;
+            const secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+
+            if (secondsDone >= secondsNeeded) { completed++; continue; }
+
+            try {
+                const appRes = await api.get({ url: `/applications/public?application_ids=${applicationId}` });
+                const appData = appRes?.body?.[0];
+                if (!appData) { failed++; continue; }
+
+                const executables = appData.executables ?? [];
+                const hasLauncher = executables.some(x => x.os === "win32" && x.isLauncher);
+                const games = createFakeGame(appData, applicationId);
+
+                console.log(`  [spoof] ${appData.name} | launcher: ${hasLauncher} | exes: ${executables.map(x => x.name).join(", ")}`);
+
+                if (hasLauncher) {
+                    launcherQuests.push({ quest, taskName, applicationId, secondsNeeded, secondsDone, appData, games });
+                } else {
+                    parallelGames.push({ quest, taskName, applicationId, secondsNeeded, secondsDone, appData, games });
+                }
+
+                allFakeGames.push(...games);
+            } catch (e) {
+                failed++;
+            }
+        }
+
+        if (parallelGames.length > 0) {
+            const parallelFakeGames = parallelGames.flatMap(g => g.games);
+            installSpoof(parallelFakeGames);
+            startKeepAlive();
+
+            for (const pq of parallelGames) {
+                desktopPromises.push(
+                    runDesktopQuest(pq.quest, pq.taskName, pq.secondsNeeded, pq.secondsDone, pq.games)
+                        .then(result => {
+                            if (result === true) completed++;
+                            else if (result === "stall" || result === "no-heartbeat") {
+                                launcherQuests.push(pq);
+                            } else failed++;
+                        })
+                );
+            }
+        }
+
+        if (launcherQuests.length > 0) {
+            console.log(`%c[Phase 3] Launcher games — running sequentially`, "color:#faa61a;font-weight:bold");
+
+            const launcherPromise = (async () => {
+                await Promise.all([...desktopPromises.filter(p => p instanceof Promise)]);
+
+                for (const lq of launcherQuests) {
+                    console.log(`  [launcher] ${lq.appData.name} — solo mode`);
+
+                    removeSpoof();
+                    await sleep(2000);
+
+                    installSpoof(lq.games);
+                    startKeepAlive();
+
+                    const result = await runDesktopQuest(lq.quest, lq.taskName, lq.secondsNeeded, lq.secondsDone, lq.games);
+
+                    if (result === true) { completed++; }
+                    else if (result === "stall" || result === "no-heartbeat") {
+                        console.log(`  [launcher] retrying with adjusted exe...`);
+                        removeSpoof();
+                        await sleep(3000);
+
+                        const altGames = createFakeGame(lq.appData, lq.applicationId, "game.exe");
+                        installSpoof(altGames);
+                        startKeepAlive();
+
+                        const retryResult = await runDesktopQuest(lq.quest, lq.taskName, lq.secondsNeeded, lq.secondsDone, altGames);
+                        if (retryResult === true) completed++;
+                        else failed++;
+                    } else failed++;
+
+                    removeSpoof();
+                    await sleep(2000);
+                }
+            })();
+
+            desktopPromises.push(launcherPromise);
+        }
+    }
+
+    await Promise.all([...videoPromises, ...activityPromises, ...desktopPromises]);
+
+    removeSpoof();
+    window.removeEventListener("unhandledrejection", unhandledHandler);
+    console.log(`%c[Quest] ALL DONE — ${completed}✓ ${failed}✗`, "color:#00b0f4;font-weight:bold;font-size:18px");
+})();
